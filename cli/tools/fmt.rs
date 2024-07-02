@@ -71,8 +71,8 @@ pub async fn format(flags: Flags, fmt_flags: FmtFlags) -> Result<(), AnyError> {
           let factory = CliFactory::from_flags(flags)?;
           let cli_options = factory.cli_options();
           let fmt_options = cli_options.resolve_fmt_options(fmt_flags)?;
-          let files =
-            collect_fmt_files(fmt_options.files.clone()).and_then(|files| {
+          let files = collect_fmt_files(cli_options, fmt_options.files.clone())
+            .and_then(|files| {
               if files.is_empty() {
                 Err(generic_error("No target files found."))
               } else {
@@ -116,8 +116,8 @@ pub async fn format(flags: Flags, fmt_flags: FmtFlags) -> Result<(), AnyError> {
     let factory = CliFactory::from_flags(flags)?;
     let cli_options = factory.cli_options();
     let fmt_options = cli_options.resolve_fmt_options(fmt_flags)?;
-    let files =
-      collect_fmt_files(fmt_options.files.clone()).and_then(|files| {
+    let files = collect_fmt_files(cli_options, fmt_options.files.clone())
+      .and_then(|files| {
         if files.is_empty() {
           Err(generic_error("No target files found."))
         } else {
@@ -153,11 +153,14 @@ async fn format_files(
   Ok(())
 }
 
-fn collect_fmt_files(files: FilePatterns) -> Result<Vec<PathBuf>, AnyError> {
+fn collect_fmt_files(
+  cli_options: &CliOptions,
+  files: FilePatterns,
+) -> Result<Vec<PathBuf>, AnyError> {
   FileCollector::new(|e| is_supported_ext_fmt(e.path))
     .ignore_git_folder()
     .ignore_node_modules()
-    .ignore_vendor_folder()
+    .set_vendor_folder(cli_options.vendor_dir_path().map(ToOwned::to_owned))
     .collect_file_patterns(files)
 }
 
@@ -208,7 +211,7 @@ fn format_markdown(
           codeblock_config.line_width = line_width;
           dprint_plugin_typescript::format_text(
             &fake_filename,
-            text,
+            text.to_string(),
             &codeblock_config,
           )
         }
@@ -252,7 +255,11 @@ pub fn format_file(
     ),
     _ => {
       let config = get_resolved_typescript_config(fmt_options);
-      dprint_plugin_typescript::format_text(file_path, file_text, &config)
+      dprint_plugin_typescript::format_text(
+        file_path,
+        file_text.to_string(),
+        &config,
+      )
     }
   }
 }
@@ -393,8 +400,8 @@ async fn format_source_files(
         }
         Err(e) => {
           let _g = output_lock.lock();
-          eprintln!("Error formatting: {}", file_path.to_string_lossy());
-          eprintln!("   {e}");
+          log::error!("Error formatting: {}", file_path.to_string_lossy());
+          log::error!("   {e}");
         }
       }
       Ok(())
@@ -492,6 +499,7 @@ fn format_stdin(fmt_options: FmtOptions, ext: &str) -> Result<(), AnyError> {
   let file_path = PathBuf::from(format!("_stdin.{ext}"));
   let formatted_text = format_file(&file_path, &source, &fmt_options.options)?;
   if fmt_options.check {
+    #[allow(clippy::print_stdout)]
     if formatted_text.is_some() {
       println!("Not formatted stdin");
     }

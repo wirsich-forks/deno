@@ -12,10 +12,10 @@ use crate::tools::test::report_tests;
 use crate::tools::test::reporters::PrettyTestReporter;
 use crate::tools::test::reporters::TestReporter;
 use crate::tools::test::run_tests_for_worker;
+use crate::tools::test::send_test_event;
 use crate::tools::test::worker_has_tests;
 use crate::tools::test::TestEvent;
 use crate::tools::test::TestEventReceiver;
-use crate::tools::test::TestEventSender;
 
 use deno_ast::diagnostics::Diagnostic;
 use deno_ast::swc::ast as swc_ast;
@@ -99,6 +99,9 @@ Object.defineProperty(globalThis, "{0}", {{
     lastThrownError: undefined,
     inspectArgs: Deno[Deno.internal].inspectArgs,
     noColor: Deno.noColor,
+    get closed() {{
+      return typeof globalThis.closed === 'undefined' ? false : globalThis.closed;
+    }}
   }},
 }});
 Object.defineProperty(globalThis, "_", {{
@@ -184,7 +187,6 @@ pub struct ReplSession {
   referrer: ModuleSpecifier,
   main_module: ModuleSpecifier,
   test_reporter_factory: Box<dyn Fn() -> Box<dyn TestReporter>>,
-  test_event_sender: TestEventSender,
   /// This is only optional because it's temporarily taken when evaluating.
   test_event_receiver: Option<TestEventReceiver>,
   jsx: ReplJsxState,
@@ -198,7 +200,6 @@ impl ReplSession {
     resolver: Arc<CliGraphResolver>,
     mut worker: MainWorker,
     main_module: ModuleSpecifier,
-    test_event_sender: TestEventSender,
     test_event_receiver: TestEventReceiver,
   ) -> Result<Self, AnyError> {
     let language_server = ReplLanguageServer::new_initialized().await?;
@@ -254,9 +255,11 @@ impl ReplSession {
       })?;
     let ts_config_for_emit = cli_options
       .resolve_ts_config_for_emit(deno_config::TsConfigType::Emit)?;
-    let emit_options =
-      crate::args::ts_config_to_emit_options(ts_config_for_emit.ts_config);
-    let experimental_decorators = emit_options.use_ts_decorators;
+    let (transpile_options, _) =
+      crate::args::ts_config_to_transpile_and_emit_options(
+        ts_config_for_emit.ts_config,
+      )?;
+    let experimental_decorators = transpile_options.use_ts_decorators;
     let mut repl_session = ReplSession {
       npm_resolver,
       resolver,
@@ -276,7 +279,6 @@ impl ReplSession {
         ))
       }),
       main_module,
-      test_event_sender,
       test_event_receiver: Some(test_event_receiver),
       jsx: ReplJsxState {
         factory: "React.createElement".to_string(),
@@ -300,8 +302,9 @@ impl ReplSession {
   }
 
   pub async fn closing(&mut self) -> Result<bool, AnyError> {
+    let expression = format!(r#"{}.closed"#, *REPL_INTERNALS_NAME);
     let closed = self
-      .evaluate_expression("(this.closed)")
+      .evaluate_expression(&expression)
       .await?
       .result
       .value
@@ -464,10 +467,11 @@ impl ReplSession {
       )
       .await
       .unwrap();
-      self
-        .test_event_sender
-        .send(TestEvent::ForceEndReport)
-        .unwrap();
+      send_test_event(
+        &self.worker.js_runtime.op_state(),
+        TestEvent::ForceEndReport,
+      )
+      .unwrap();
       self.test_event_receiver = Some(report_tests_handle.await.unwrap().1);
     }
 
@@ -619,23 +623,31 @@ impl ReplSession {
     self.analyze_and_handle_jsx(&parsed_source);
 
     let transpiled_src = parsed_source
-      .transpile(&deno_ast::EmitOptions {
-        use_ts_decorators: self.experimental_decorators,
-        use_decorators_proposal: !self.experimental_decorators,
-        emit_metadata: false,
-        source_map: false,
-        inline_source_map: false,
-        inline_sources: false,
-        imports_not_used_as_values: ImportsNotUsedAsValues::Preserve,
-        transform_jsx: true,
-        precompile_jsx: false,
-        jsx_automatic: self.jsx.import_source.is_some(),
-        jsx_development: false,
-        jsx_factory: self.jsx.factory.clone(),
-        jsx_fragment_factory: self.jsx.frag_factory.clone(),
-        jsx_import_source: self.jsx.import_source.clone(),
-        var_decl_imports: true,
-      })?
+      .transpile(
+        &deno_ast::TranspileOptions {
+          use_ts_decorators: self.experimental_decorators,
+          use_decorators_proposal: !self.experimental_decorators,
+          emit_metadata: false,
+          imports_not_used_as_values: ImportsNotUsedAsValues::Preserve,
+          transform_jsx: true,
+          precompile_jsx: false,
+          precompile_jsx_skip_elements: None,
+          jsx_automatic: self.jsx.import_source.is_some(),
+          jsx_development: false,
+          jsx_factory: self.jsx.factory.clone(),
+          jsx_fragment_factory: self.jsx.frag_factory.clone(),
+          jsx_import_source: self.jsx.import_source.clone(),
+          var_decl_imports: true,
+        },
+        &deno_ast::EmitOptions {
+          source_map: deno_ast::SourceMapOption::None,
+          source_map_file: None,
+          inline_sources: false,
+          remove_comments: false,
+        },
+      )?
+      .into_source()
+      .into_string()?
       .text;
 
     let value = self
@@ -810,7 +822,7 @@ fn parse_source_as(
 
   let parsed = deno_ast::parse_module(deno_ast::ParseParams {
     specifier,
-    text_info: deno_ast::SourceTextInfo::from_string(source),
+    text: source.into(),
     media_type,
     capture_tokens: true,
     maybe_syntax: None,
@@ -877,7 +889,7 @@ fn analyze_jsx_pragmas(
           range: comment_source_to_position_range(
             c.start(),
             &m,
-            parsed_source.text_info(),
+            parsed_source.text_info_lazy(),
             true,
           ),
         });
@@ -891,7 +903,7 @@ fn analyze_jsx_pragmas(
           range: comment_source_to_position_range(
             c.start(),
             &m,
-            parsed_source.text_info(),
+            parsed_source.text_info_lazy(),
             false,
           ),
         });
@@ -905,7 +917,7 @@ fn analyze_jsx_pragmas(
           range: comment_source_to_position_range(
             c.start(),
             &m,
-            parsed_source.text_info(),
+            parsed_source.text_info_lazy(),
             false,
           ),
         });

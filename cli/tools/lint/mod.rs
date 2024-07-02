@@ -17,6 +17,7 @@ use deno_core::parking_lot::Mutex;
 use deno_core::serde_json;
 use deno_graph::FastCheckDiagnostic;
 use deno_lint::diagnostic::LintDiagnostic;
+use deno_lint::linter::LintConfig;
 use deno_lint::linter::LintFileOptions;
 use deno_lint::linter::Linter;
 use deno_lint::linter::LinterBuilder;
@@ -34,6 +35,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::args::CliOptions;
 use crate::args::Flags;
 use crate::args::LintFlags;
 use crate::args::LintOptions;
@@ -78,15 +80,16 @@ pub async fn lint(flags: Flags, lint_flags: LintFlags) -> Result<(), AnyError> {
           let factory = CliFactory::from_flags(flags)?;
           let cli_options = factory.cli_options();
           let lint_options = cli_options.resolve_lint_options(lint_flags)?;
-          let files = collect_lint_files(lint_options.files.clone()).and_then(
-            |files| {
-              if files.is_empty() {
-                Err(generic_error("No target files found."))
-              } else {
-                Ok(files)
-              }
-            },
-          )?;
+          let lint_config = cli_options.resolve_lint_config()?;
+          let files =
+            collect_lint_files(cli_options, lint_options.files.clone())
+              .and_then(|files| {
+                if files.is_empty() {
+                  Err(generic_error("No target files found."))
+                } else {
+                  Ok(files)
+                }
+              })?;
           _ = watcher_communicator.watch_paths(files.clone());
 
           let lint_paths = if let Some(paths) = changed_paths {
@@ -104,7 +107,7 @@ pub async fn lint(flags: Flags, lint_flags: LintFlags) -> Result<(), AnyError> {
             files
           };
 
-          lint_files(factory, lint_options, lint_paths).await?;
+          lint_files(factory, lint_options, lint_config, lint_paths).await?;
           Ok(())
         })
       },
@@ -115,6 +118,7 @@ pub async fn lint(flags: Flags, lint_flags: LintFlags) -> Result<(), AnyError> {
     let cli_options = factory.cli_options();
     let is_stdin = lint_flags.is_stdin();
     let lint_options = cli_options.resolve_lint_options(lint_flags)?;
+    let lint_config = cli_options.resolve_lint_config()?;
     let files = &lint_options.files;
     let success = if is_stdin {
       let reporter_kind = lint_options.reporter_kind;
@@ -124,7 +128,7 @@ pub async fn lint(flags: Flags, lint_flags: LintFlags) -> Result<(), AnyError> {
         cli_options.maybe_config_file().as_ref(),
       )?;
       let file_path = cli_options.initial_cwd().join(STDIN_FILE_NAME);
-      let r = lint_stdin(&file_path, lint_rules.rules);
+      let r = lint_stdin(&file_path, lint_rules.rules, lint_config);
       let success = handle_lint_result(
         &file_path.to_string_lossy(),
         r,
@@ -133,8 +137,8 @@ pub async fn lint(flags: Flags, lint_flags: LintFlags) -> Result<(), AnyError> {
       reporter_lock.lock().close(1);
       success
     } else {
-      let target_files =
-        collect_lint_files(files.clone()).and_then(|files| {
+      let target_files = collect_lint_files(cli_options, files.clone())
+        .and_then(|files| {
           if files.is_empty() {
             Err(generic_error("No target files found."))
           } else {
@@ -142,7 +146,7 @@ pub async fn lint(flags: Flags, lint_flags: LintFlags) -> Result<(), AnyError> {
           }
         })?;
       debug!("Found {} files", target_files.len());
-      lint_files(factory, lint_options, target_files).await?
+      lint_files(factory, lint_options, lint_config, target_files).await?
     };
     if !success {
       std::process::exit(1);
@@ -155,6 +159,7 @@ pub async fn lint(flags: Flags, lint_flags: LintFlags) -> Result<(), AnyError> {
 async fn lint_files(
   factory: CliFactory,
   lint_options: LintOptions,
+  lint_config: LintConfig,
   paths: Vec<PathBuf>,
 ) -> Result<bool, AnyError> {
   let caches = factory.caches()?;
@@ -220,25 +225,26 @@ async fn lint_files(
     let linter = create_linter(lint_rules.rules);
     let reporter_lock = reporter_lock.clone();
     let incremental_cache = incremental_cache.clone();
+    let lint_config = lint_config.clone();
     let fix = lint_options.fix;
     deno_core::unsync::spawn(async move {
       run_parallelized(paths, {
         move |file_path| {
-          let file_text = fs::read_to_string(&file_path)?;
+          let file_text = deno_ast::strip_bom(fs::read_to_string(&file_path)?);
 
           // don't bother rechecking this file if it didn't have any diagnostics before
           if incremental_cache.is_file_same(&file_path, &file_text) {
             return Ok(());
           }
 
-          let r = lint_file(&linter, &file_path, file_text, fix);
+          let r = lint_file(&linter, &file_path, file_text, lint_config, fix);
           if let Ok((file_source, file_diagnostics)) = &r {
             if file_diagnostics.is_empty() {
               // update the incremental cache if there were no diagnostics
               incremental_cache.update_file(
                 &file_path,
                 // ensure the returned text is used here as it may have been modified via --fix
-                file_source.text_info().text_str(),
+                file_source.text(),
               )
             }
           }
@@ -267,14 +273,18 @@ async fn lint_files(
   Ok(!has_error.is_raised())
 }
 
-fn collect_lint_files(files: FilePatterns) -> Result<Vec<PathBuf>, AnyError> {
+fn collect_lint_files(
+  cli_options: &CliOptions,
+  files: FilePatterns,
+) -> Result<Vec<PathBuf>, AnyError> {
   FileCollector::new(|e| is_script_ext(e.path))
     .ignore_git_folder()
     .ignore_node_modules()
-    .ignore_vendor_folder()
+    .set_vendor_folder(cli_options.vendor_dir_path().map(ToOwned::to_owned))
     .collect_file_patterns(files)
 }
 
+#[allow(clippy::print_stdout)]
 pub fn print_rules_list(json: bool, maybe_rules_tags: Option<Vec<String>>) {
   let lint_rules = if maybe_rules_tags.is_none() {
     rules::get_all_rules()
@@ -330,19 +340,28 @@ fn lint_file(
   linter: &Linter,
   file_path: &Path,
   source_code: String,
+  config: LintConfig,
   fix: bool,
 ) -> Result<(ParsedSource, Vec<LintDiagnostic>), AnyError> {
   let specifier = specifier_from_file_path(file_path)?;
   let media_type = MediaType::from_specifier(&specifier);
 
   if fix {
-    lint_file_and_fix(linter, &specifier, media_type, source_code, file_path)
+    lint_file_and_fix(
+      linter,
+      &specifier,
+      media_type,
+      source_code,
+      file_path,
+      config,
+    )
   } else {
     linter
       .lint_file(LintFileOptions {
         specifier,
         media_type,
         source_code,
+        config,
       })
       .map_err(AnyError::from)
   }
@@ -354,12 +373,14 @@ fn lint_file_and_fix(
   media_type: MediaType,
   source_code: String,
   file_path: &Path,
+  config: LintConfig,
 ) -> Result<(ParsedSource, Vec<LintDiagnostic>), deno_core::anyhow::Error> {
   // initial lint
   let (source, diagnostics) = linter.lint_file(LintFileOptions {
     specifier: specifier.clone(),
     media_type,
     source_code,
+    config: config.clone(),
   })?;
 
   // Try applying fixes repeatedly until the file has none left or
@@ -374,7 +395,8 @@ fn lint_file_and_fix(
       specifier,
       media_type,
       linter,
-      source.text_info(),
+      config.clone(),
+      source.text_info_lazy(),
       &diagnostics,
     )?;
     match change {
@@ -401,7 +423,7 @@ fn lint_file_and_fix(
 
   if fix_iterations > 0 {
     // everything looks good and the file still parses, so write it out
-    fs::write(file_path, source.text_info().text_str())
+    fs::write(file_path, source.text().as_ref())
       .context("Failed writing fix to file.")?;
   }
 
@@ -412,6 +434,7 @@ fn apply_lint_fixes_and_relint(
   specifier: &ModuleSpecifier,
   media_type: MediaType,
   linter: &Linter,
+  config: LintConfig,
   text_info: &SourceTextInfo,
   diagnostics: &[LintDiagnostic],
 ) -> Result<Option<(ParsedSource, Vec<LintDiagnostic>)>, AnyError> {
@@ -423,6 +446,7 @@ fn apply_lint_fixes_and_relint(
       specifier: specifier.clone(),
       source_code: new_text,
       media_type,
+      config,
     })
     .map(Some)
     .context(
@@ -474,6 +498,7 @@ fn apply_lint_fixes(
 fn lint_stdin(
   file_path: &Path,
   lint_rules: Vec<&'static dyn LintRule>,
+  config: LintConfig,
 ) -> Result<(ParsedSource, Vec<LintDiagnostic>), AnyError> {
   let mut source_code = String::new();
   if stdin().read_to_string(&mut source_code).is_err() {
@@ -485,8 +510,9 @@ fn lint_stdin(
   linter
     .lint_file(LintFileOptions {
       specifier: specifier_from_file_path(file_path)?,
-      source_code: source_code.clone(),
+      source_code: deno_ast::strip_bom(source_code),
       media_type: MediaType::TypeScript,
+      config,
     })
     .map_err(AnyError::from)
 }
@@ -642,12 +668,12 @@ impl LintReporter for PrettyLintReporter {
       }
     }
 
-    eprintln!("{}", d.display());
+    log::error!("{}\n", d.display());
   }
 
   fn visit_error(&mut self, file_path: &str, err: &AnyError) {
-    eprintln!("Error linting: {file_path}");
-    eprintln!("   {err}");
+    log::error!("Error linting: {file_path}");
+    log::error!("   {err}");
   }
 
   fn close(&mut self, check_count: usize) {
@@ -690,7 +716,7 @@ impl LintReporter for CompactLintReporter {
     match d.range() {
       Some((text_info, range)) => {
         let line_and_column = text_info.line_and_column_display(range.start);
-        eprintln!(
+        log::error!(
           "{}: line {}, col {} - {} ({})",
           d.specifier(),
           line_and_column.line_number,
@@ -700,14 +726,14 @@ impl LintReporter for CompactLintReporter {
         )
       }
       None => {
-        eprintln!("{}: {} ({})", d.specifier(), d.message(), d.code())
+        log::error!("{}: {} ({})", d.specifier(), d.message(), d.code())
       }
     }
   }
 
   fn visit_error(&mut self, file_path: &str, err: &AnyError) {
-    eprintln!("Error linting: {file_path}");
-    eprintln!("   {err}");
+    log::error!("Error linting: {file_path}");
+    log::error!("   {err}");
   }
 
   fn close(&mut self, check_count: usize) {
@@ -808,7 +834,10 @@ impl LintReporter for JsonLintReporter {
   fn close(&mut self, _check_count: usize) {
     sort_diagnostics(&mut self.diagnostics);
     let json = serde_json::to_string_pretty(&self);
-    println!("{}", json.unwrap());
+    #[allow(clippy::print_stdout)]
+    {
+      println!("{}", json.unwrap());
+    }
   }
 }
 
@@ -882,7 +911,7 @@ pub fn get_configured_rules(
 ) -> ConfiguredRules {
   const NO_SLOW_TYPES_NAME: &str = "no-slow-types";
   let implicit_no_slow_types = maybe_config_file
-    .map(|c| c.is_package() || !c.json.workspaces.is_empty())
+    .map(|c| c.is_package() || c.json.workspace.is_some())
     .unwrap_or(false);
   let no_slow_types = implicit_no_slow_types
     && !rules

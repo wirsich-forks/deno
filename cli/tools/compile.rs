@@ -3,6 +3,7 @@
 use crate::args::CompileFlags;
 use crate::args::Flags;
 use crate::factory::CliFactory;
+use crate::http_util::HttpClientProvider;
 use crate::standalone::is_standalone_binary;
 use deno_core::anyhow::bail;
 use deno_core::anyhow::Context;
@@ -11,6 +12,7 @@ use deno_core::error::AnyError;
 use deno_core::resolve_url_or_path;
 use deno_graph::GraphKind;
 use deno_terminal::colors;
+use rand::Rng;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ pub async fn compile(
   let module_graph_creator = factory.module_graph_creator().await?;
   let parsed_source_cache = factory.parsed_source_cache();
   let binary_writer = factory.create_compile_binary_writer().await?;
+  let http_client = factory.http_client_provider();
   let module_specifier = cli_options.resolve_main_module()?;
   let module_roots = {
     let mut vec = Vec::with_capacity(compile_flags.include.len() + 1);
@@ -49,6 +52,7 @@ pub async fn compile(
   }
 
   let output_path = resolve_compile_executable_output_path(
+    http_client,
     &compile_flags,
     cli_options.initial_cwd(),
   )
@@ -73,10 +77,18 @@ pub async fn compile(
 
   let ts_config_for_emit =
     cli_options.resolve_ts_config_for_emit(deno_config::TsConfigType::Emit)?;
-  let emit_options =
-    crate::args::ts_config_to_emit_options(ts_config_for_emit.ts_config);
+  let (transpile_options, emit_options) =
+    crate::args::ts_config_to_transpile_and_emit_options(
+      ts_config_for_emit.ts_config,
+    )?;
   let parser = parsed_source_cache.as_capturing_parser();
-  let eszip = eszip::EszipV2::from_graph(graph, &parser, emit_options)?;
+  let eszip = eszip::EszipV2::from_graph(eszip::FromGraphOptions {
+    graph,
+    parser,
+    transpile_options,
+    emit_options,
+    relative_file_base: None,
+  })?;
 
   log::info!(
     "{} {} to {}",
@@ -86,8 +98,20 @@ pub async fn compile(
   );
   validate_output_path(&output_path)?;
 
-  let mut file = std::fs::File::create(&output_path)
-    .with_context(|| format!("Opening file '{}'", output_path.display()))?;
+  let mut temp_filename = output_path.file_name().unwrap().to_owned();
+  temp_filename.push(format!(
+    ".tmp-{}",
+    faster_hex::hex_encode(
+      &rand::thread_rng().gen::<[u8; 8]>(),
+      &mut [0u8; 16]
+    )
+    .unwrap()
+  ));
+  let temp_path = output_path.with_file_name(temp_filename);
+
+  let mut file = std::fs::File::create(&temp_path).with_context(|| {
+    format!("Opening temporary file '{}'", temp_path.display())
+  })?;
   let write_result = binary_writer
     .write_bin(
       &mut file,
@@ -97,20 +121,38 @@ pub async fn compile(
       cli_options,
     )
     .await
-    .with_context(|| format!("Writing {}", output_path.display()));
+    .with_context(|| {
+      format!("Writing temporary file '{}'", temp_path.display())
+    });
   drop(file);
-  if let Err(err) = write_result {
-    // errored, so attempt to remove the output path
-    let _ = std::fs::remove_file(output_path);
-    return Err(err);
-  }
 
   // set it as executable
   #[cfg(unix)]
-  {
+  let write_result = write_result.and_then(|_| {
     use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o777);
-    std::fs::set_permissions(output_path, perms)?;
+    let perms = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(&temp_path, perms).with_context(|| {
+      format!(
+        "Setting permissions on temporary file '{}'",
+        temp_path.display()
+      )
+    })
+  });
+
+  let write_result = write_result.and_then(|_| {
+    std::fs::rename(&temp_path, &output_path).with_context(|| {
+      format!(
+        "Renaming temporary file '{}' to '{}'",
+        temp_path.display(),
+        output_path.display()
+      )
+    })
+  });
+
+  if let Err(err) = write_result {
+    // errored, so attempt to remove the temporary file
+    let _ = std::fs::remove_file(temp_path);
+    return Err(err);
   }
 
   Ok(())
@@ -167,6 +209,7 @@ fn validate_output_path(output_path: &Path) -> Result<(), AnyError> {
 }
 
 async fn resolve_compile_executable_output_path(
+  http_client_provider: &HttpClientProvider,
   compile_flags: &CompileFlags,
   current_dir: &Path,
 ) -> Result<PathBuf, AnyError> {
@@ -177,9 +220,10 @@ async fn resolve_compile_executable_output_path(
   let mut output_path = if let Some(out) = output_flag.as_ref() {
     let mut out_path = PathBuf::from(out);
     if out.ends_with('/') || out.ends_with('\\') {
-      if let Some(infer_file_name) = infer_name_from_url(&module_specifier)
-        .await
-        .map(PathBuf::from)
+      if let Some(infer_file_name) =
+        infer_name_from_url(http_client_provider, &module_specifier)
+          .await
+          .map(PathBuf::from)
       {
         out_path = out_path.join(infer_file_name);
       }
@@ -192,7 +236,7 @@ async fn resolve_compile_executable_output_path(
   };
 
   if output_flag.is_none() {
-    output_path = infer_name_from_url(&module_specifier)
+    output_path = infer_name_from_url(http_client_provider, &module_specifier)
       .await
       .map(PathBuf::from)
   }
@@ -230,7 +274,9 @@ mod test {
 
   #[tokio::test]
   async fn resolve_compile_executable_output_path_target_linux() {
+    let http_client = HttpClientProvider::new(None, None);
     let path = resolve_compile_executable_output_path(
+      &http_client,
       &CompileFlags {
         source_file: "mod.ts".to_string(),
         output: Some(String::from("./file")),
@@ -252,7 +298,9 @@ mod test {
 
   #[tokio::test]
   async fn resolve_compile_executable_output_path_target_windows() {
+    let http_client = HttpClientProvider::new(None, None);
     let path = resolve_compile_executable_output_path(
+      &http_client,
       &CompileFlags {
         source_file: "mod.ts".to_string(),
         output: Some(String::from("./file")),

@@ -1,5 +1,6 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -71,6 +72,7 @@ pub enum FsFileType {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsDirEntry {
+  pub parent_path: String,
   pub name: String,
   pub is_file: bool,
   pub is_directory: bool,
@@ -79,6 +81,25 @@ pub struct FsDirEntry {
 
 #[allow(clippy::disallowed_types)]
 pub type FileSystemRc = crate::sync::MaybeArc<dyn FileSystem>;
+
+pub trait AccessCheckFn:
+  for<'a> FnMut(
+  bool,
+  &'a Path,
+  &'a OpenOptions,
+) -> FsResult<std::borrow::Cow<'a, Path>>
+{
+}
+impl<T> AccessCheckFn for T where
+  T: for<'a> FnMut(
+    bool,
+    &'a Path,
+    &'a OpenOptions,
+  ) -> FsResult<std::borrow::Cow<'a, Path>>
+{
+}
+
+pub type AccessCheckCb<'a> = &'a mut (dyn AccessCheckFn + 'a);
 
 #[async_trait::async_trait(?Send)]
 pub trait FileSystem: std::fmt::Debug + MaybeSend + MaybeSync {
@@ -91,11 +112,13 @@ pub trait FileSystem: std::fmt::Debug + MaybeSend + MaybeSync {
     &self,
     path: &Path,
     options: OpenOptions,
+    access_check: Option<AccessCheckCb>,
   ) -> FsResult<Rc<dyn File>>;
-  async fn open_async(
-    &self,
+  async fn open_async<'a>(
+    &'a self,
     path: PathBuf,
     options: OpenOptions,
+    access_check: Option<AccessCheckCb<'a>>,
   ) -> FsResult<Rc<dyn File>>;
 
   fn mkdir_sync(&self, path: &Path, recursive: bool, mode: u32)
@@ -202,22 +225,24 @@ pub trait FileSystem: std::fmt::Debug + MaybeSend + MaybeSync {
     &self,
     path: &Path,
     options: OpenOptions,
+    access_check: Option<AccessCheckCb>,
     data: &[u8],
   ) -> FsResult<()> {
-    let file = self.open_sync(path, options)?;
+    let file = self.open_sync(path, options, access_check)?;
     if let Some(mode) = options.mode {
       file.clone().chmod_sync(mode)?;
     }
     file.write_all_sync(data)?;
     Ok(())
   }
-  async fn write_file_async(
-    &self,
+  async fn write_file_async<'a>(
+    &'a self,
     path: PathBuf,
     options: OpenOptions,
+    access_check: Option<AccessCheckCb<'a>>,
     data: Vec<u8>,
   ) -> FsResult<()> {
-    let file = self.open_async(path, options).await?;
+    let file = self.open_async(path, options, access_check).await?;
     if let Some(mode) = options.mode {
       file.clone().chmod_async(mode).await?;
     }
@@ -225,15 +250,23 @@ pub trait FileSystem: std::fmt::Debug + MaybeSend + MaybeSync {
     Ok(())
   }
 
-  fn read_file_sync(&self, path: &Path) -> FsResult<Vec<u8>> {
+  fn read_file_sync(
+    &self,
+    path: &Path,
+    access_check: Option<AccessCheckCb>,
+  ) -> FsResult<Vec<u8>> {
     let options = OpenOptions::read();
-    let file = self.open_sync(path, options)?;
+    let file = self.open_sync(path, options, access_check)?;
     let buf = file.read_all_sync()?;
     Ok(buf)
   }
-  async fn read_file_async(&self, path: PathBuf) -> FsResult<Vec<u8>> {
+  async fn read_file_async<'a>(
+    &'a self,
+    path: PathBuf,
+    access_check: Option<AccessCheckCb<'a>>,
+  ) -> FsResult<Vec<u8>> {
     let options = OpenOptions::read();
-    let file = self.open_async(path, options).await?;
+    let file = self.open_async(path, options, access_check).await?;
     let buf = file.read_all_async().await?;
     Ok(buf)
   }
@@ -253,16 +286,61 @@ pub trait FileSystem: std::fmt::Debug + MaybeSend + MaybeSync {
     self.stat_sync(path).is_ok()
   }
 
-  fn read_text_file_sync(&self, path: &Path) -> FsResult<String> {
-    let buf = self.read_file_sync(path)?;
-    String::from_utf8(buf).map_err(|err| {
-      std::io::Error::new(std::io::ErrorKind::InvalidData, err).into()
-    })
+  fn read_text_file_lossy_sync(
+    &self,
+    path: &Path,
+    access_check: Option<AccessCheckCb>,
+  ) -> FsResult<String> {
+    let buf = self.read_file_sync(path, access_check)?;
+    Ok(string_from_utf8_lossy(buf))
   }
-  async fn read_text_file_async(&self, path: PathBuf) -> FsResult<String> {
-    let buf = self.read_file_async(path).await?;
-    String::from_utf8(buf).map_err(|err| {
-      std::io::Error::new(std::io::ErrorKind::InvalidData, err).into()
-    })
+  async fn read_text_file_lossy_async<'a>(
+    &'a self,
+    path: PathBuf,
+    access_check: Option<AccessCheckCb<'a>>,
+  ) -> FsResult<String> {
+    let buf = self.read_file_async(path, access_check).await?;
+    Ok(string_from_utf8_lossy(buf))
+  }
+}
+
+pub struct DenoConfigFsAdapter<'a>(&'a dyn FileSystem);
+
+impl<'a> DenoConfigFsAdapter<'a> {
+  pub fn new(fs: &'a dyn FileSystem) -> Self {
+    Self(fs)
+  }
+}
+
+impl<'a> deno_config::fs::DenoConfigFs for DenoConfigFsAdapter<'a> {
+  fn read_to_string(&self, path: &Path) -> Result<String, std::io::Error> {
+    use deno_io::fs::FsError;
+    use std::io::ErrorKind;
+    self
+      .0
+      .read_text_file_lossy_sync(path, None)
+      .map_err(|err| match err {
+        FsError::Io(io) => io,
+        FsError::FileBusy => std::io::Error::new(ErrorKind::Other, "file busy"),
+        FsError::NotSupported => {
+          std::io::Error::new(ErrorKind::Other, "not supported")
+        }
+        FsError::PermissionDenied(name) => std::io::Error::new(
+          ErrorKind::PermissionDenied,
+          format!("requires {}", name),
+        ),
+      })
+  }
+}
+
+// Like String::from_utf8_lossy but operates on owned values
+#[inline(always)]
+fn string_from_utf8_lossy(buf: Vec<u8>) -> String {
+  match String::from_utf8_lossy(&buf) {
+    // buf contained non-utf8 chars than have been patched
+    Cow::Owned(s) => s,
+    // SAFETY: if Borrowed then the buf only contains utf8 chars,
+    // we do this instead of .into_owned() to avoid copying the input buf
+    Cow::Borrowed(_) => unsafe { String::from_utf8_unchecked(buf) },
   }
 }

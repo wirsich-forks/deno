@@ -7,7 +7,6 @@ use deno_core::serde_v8::BigInt as V8BigInt;
 use deno_core::unsync::spawn_blocking;
 use deno_core::JsBuffer;
 use deno_core::OpState;
-use deno_core::ResourceId;
 use deno_core::StringOrBuffer;
 use deno_core::ToJsBuffer;
 use elliptic_curve::sec1::ToEncodedPoint;
@@ -42,6 +41,7 @@ use rsa::Oaep;
 use rsa::Pkcs1v15Encrypt;
 use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
+use spki::EncodePublicKey;
 
 mod cipher;
 mod dh;
@@ -95,18 +95,13 @@ pub fn op_node_check_prime_bytes_async(
   })
 }
 
-#[op2(fast)]
-#[smi]
+#[op2]
+#[cppgc]
 pub fn op_node_create_hash(
-  state: &mut OpState,
   #[string] algorithm: &str,
-) -> u32 {
-  state
-    .resource_table
-    .add(match digest::Context::new(algorithm) {
-      Ok(context) => context,
-      Err(_) => return 0,
-    })
+  output_length: Option<u32>,
+) -> Result<digest::Hasher, AnyError> {
+  digest::Hasher::new(algorithm, output_length.map(|l| l as usize))
 }
 
 #[op2]
@@ -117,65 +112,44 @@ pub fn op_node_get_hashes() -> Vec<&'static str> {
 
 #[op2(fast)]
 pub fn op_node_hash_update(
-  state: &mut OpState,
-  #[smi] rid: u32,
+  #[cppgc] hasher: &digest::Hasher,
   #[buffer] data: &[u8],
 ) -> bool {
-  let context = match state.resource_table.get::<digest::Context>(rid) {
-    Ok(context) => context,
-    _ => return false,
-  };
-  context.update(data);
-  true
+  hasher.update(data)
 }
 
 #[op2(fast)]
 pub fn op_node_hash_update_str(
-  state: &mut OpState,
-  #[smi] rid: u32,
+  #[cppgc] hasher: &digest::Hasher,
   #[string] data: &str,
 ) -> bool {
-  let context = match state.resource_table.get::<digest::Context>(rid) {
-    Ok(context) => context,
-    _ => return false,
-  };
-  context.update(data.as_bytes());
-  true
+  hasher.update(data.as_bytes())
 }
 
 #[op2]
-#[serde]
+#[buffer]
 pub fn op_node_hash_digest(
-  state: &mut OpState,
-  #[smi] rid: ResourceId,
-) -> Result<ToJsBuffer, AnyError> {
-  let context = state.resource_table.take::<digest::Context>(rid)?;
-  let context = Rc::try_unwrap(context)
-    .map_err(|_| type_error("Hash context is already in use"))?;
-  Ok(context.digest()?.into())
+  #[cppgc] hasher: &digest::Hasher,
+) -> Option<Box<[u8]>> {
+  hasher.digest()
 }
 
 #[op2]
 #[string]
 pub fn op_node_hash_digest_hex(
-  state: &mut OpState,
-  #[smi] rid: ResourceId,
-) -> Result<String, AnyError> {
-  let context = state.resource_table.take::<digest::Context>(rid)?;
-  let context = Rc::try_unwrap(context)
-    .map_err(|_| type_error("Hash context is already in use"))?;
-  let digest = context.digest()?;
-  Ok(faster_hex::hex_string(&digest))
+  #[cppgc] hasher: &digest::Hasher,
+) -> Option<String> {
+  let digest = hasher.digest()?;
+  Some(faster_hex::hex_string(&digest))
 }
 
-#[op2(fast)]
-#[smi]
+#[op2]
+#[cppgc]
 pub fn op_node_hash_clone(
-  state: &mut OpState,
-  #[smi] rid: ResourceId,
-) -> Result<ResourceId, AnyError> {
-  let context = state.resource_table.get::<digest::Context>(rid)?;
-  Ok(state.resource_table.add(context.as_ref().clone()))
+  #[cppgc] hasher: &digest::Hasher,
+  output_length: Option<u32>,
+) -> Result<Option<digest::Hasher>, AnyError> {
+  hasher.clone_inner(output_length.map(|l| l as usize))
 }
 
 #[op2]
@@ -681,13 +655,32 @@ pub async fn op_node_generate_rsa_async(
   spawn_blocking(move || generate_rsa(modulus_length, public_exponent)).await?
 }
 
+#[op2]
+#[string]
+pub fn op_node_export_rsa_public_pem(
+  #[buffer] pkcs1_der: &[u8],
+) -> Result<String, AnyError> {
+  let public_key = RsaPublicKey::from_pkcs1_der(pkcs1_der)?;
+  let export = public_key.to_public_key_pem(Default::default())?;
+  Ok(export)
+}
+
+#[op2]
+#[serde]
+pub fn op_node_export_rsa_spki_der(
+  #[buffer] pkcs1_der: &[u8],
+) -> Result<ToJsBuffer, AnyError> {
+  let public_key = RsaPublicKey::from_pkcs1_der(pkcs1_der)?;
+  let export = public_key.to_public_key_der()?.to_vec();
+  Ok(export.into())
+}
+
 fn dsa_generate(
   modulus_length: usize,
   divisor_length: usize,
 ) -> Result<(ToJsBuffer, ToJsBuffer), AnyError> {
   let mut rng = rand::thread_rng();
   use dsa::pkcs8::EncodePrivateKey;
-  use dsa::pkcs8::EncodePublicKey;
   use dsa::Components;
   use dsa::KeySize;
   use dsa::SigningKey;
@@ -1404,6 +1397,7 @@ pub const EC_OID: const_oid::ObjectIdentifier =
 // }
 pub struct PssPrivateKeyParameters<'a> {
   pub hash_algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
+  #[allow(dead_code)]
   pub mask_gen_algorithm: rsa::pkcs8::AlgorithmIdentifierRef<'a>,
   pub salt_length: u32,
 }
@@ -1472,8 +1466,13 @@ fn parse_private_key(
 ) -> Result<pkcs8::SecretDocument, AnyError> {
   match format {
     "pem" => {
-      let (_, doc) =
-        pkcs8::SecretDocument::from_pem(std::str::from_utf8(key).unwrap())?;
+      let pem = std::str::from_utf8(key).map_err(|err| {
+        type_error(format!(
+          "Invalid PEM private key: not valid utf8 starting at byte {}",
+          err.valid_up_to()
+        ))
+      })?;
+      let (_, doc) = pkcs8::SecretDocument::from_pem(pem)?;
       Ok(doc)
     }
     "der" => {
@@ -1579,8 +1578,13 @@ fn parse_public_key(
 ) -> Result<pkcs8::Document, AnyError> {
   match format {
     "pem" => {
-      let (label, doc) =
-        pkcs8::Document::from_pem(std::str::from_utf8(key).unwrap())?;
+      let pem = std::str::from_utf8(key).map_err(|err| {
+        type_error(format!(
+          "Invalid PEM private key: not valid utf8 starting at byte {}",
+          err.valid_up_to()
+        ))
+      })?;
+      let (label, doc) = pkcs8::Document::from_pem(pem)?;
       if label != "PUBLIC KEY" {
         return Err(type_error("Invalid PEM label"));
       }

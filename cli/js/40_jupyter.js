@@ -40,7 +40,7 @@ import { core, internals } from "ext:core/mod.js";
 
 const $display = Symbol.for("Jupyter.display");
 
-/** Escape copied from https://deno.land/std@0.192.0/html/entities.ts */
+/** Escape copied from https://jsr.io/@std/html/0.221.0/entities.ts */
 const rawToEntityEntries = [
   ["&", "&amp;"],
   ["<", "&lt;"],
@@ -342,7 +342,7 @@ function enableJupyter() {
   async function broadcast(
     msgType,
     content,
-    { metadata = {}, buffers = [] } = {},
+    { metadata = { __proto__: null }, buffers = [] } = { __proto__: null },
   ) {
     await op_jupyter_broadcast(msgType, content, metadata, buffers);
   }
@@ -400,7 +400,7 @@ function enableJupyter() {
     if (options.update) {
       messageType = "update_display_data";
     }
-    let transient = {};
+    let transient = { __proto__: null };
     if (options.display_id) {
       transient = { display_id: options.display_id };
     }
