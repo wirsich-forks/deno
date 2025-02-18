@@ -819,7 +819,8 @@ pub enum Host {
   Ip(IpAddr),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+#[class(uri)]
 pub enum HostParseError {
   #[error("invalid IPv6 address: '{0}'")]
   InvalidIpv6(String),
@@ -954,10 +955,12 @@ pub enum NetDescriptorParseError {
   Host(#[from] HostParseError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum NetDescriptorFromUrlParseError {
+  #[class(type)]
   #[error("Missing host in url: '{0}'")]
   MissingHost(Url),
+  #[class(inherit)]
   #[error("{0}")]
   Host(#[from] HostParseError),
 }
@@ -1324,10 +1327,12 @@ pub enum RunQueryDescriptor {
   Name(String),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum PathResolveError {
+  #[class(inherit)]
   #[error("failed resolving cwd: {0}")]
   CwdResolve(#[source] std::io::Error),
+  #[class(generic)]
   #[error("Empty path is not allowed")]
   EmptyPath,
 }
@@ -1484,12 +1489,15 @@ pub enum AllowRunDescriptorParseResult {
   Descriptor(AllowRunDescriptor),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum RunDescriptorParseError {
+  #[class(generic)]
   #[error("{0}")]
   Which(#[from] which::Error),
+  #[class(inherit)]
   #[error("{0}")]
   PathResolve(#[from] PathResolveError),
+  #[class(generic)]
   #[error("Empty run query is not allowed")]
   EmptyRunQuery,
 }
@@ -1573,10 +1581,12 @@ fn denies_run_name(name: &str, cmd_path: &Path) -> bool {
   suffix.is_empty() || suffix.starts_with('.')
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum SysDescriptorParseError {
+  #[class(type)]
   #[error("unknown system info kind \"{0}\"")]
-  InvalidKind(String), // TypeError
+  InvalidKind(String),
+  #[class(generic)]
   #[error("Empty sys not allowed")]
   Empty, // Error
 }
@@ -2301,36 +2311,51 @@ pub enum CheckSpecifierKind {
   Dynamic,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum ChildPermissionError {
+  #[class("NotCapable")]
   #[error("Can't escalate parent thread permissions")]
   Escalation,
+  #[class(inherit)]
   #[error("{0}")]
   PathResolve(#[from] PathResolveError),
+  #[class(uri)]
   #[error("{0}")]
   NetDescriptorParse(#[from] NetDescriptorParseError),
+  #[class(generic)]
   #[error("{0}")]
   EnvDescriptorParse(#[from] EnvDescriptorParseError),
+  #[class(inherit)]
   #[error("{0}")]
   SysDescriptorParse(#[from] SysDescriptorParseError),
+  #[class(inherit)]
   #[error("{0}")]
   RunDescriptorParse(#[from] RunDescriptorParseError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum PermissionCheckError {
+  #[class("NotCapable")]
   #[error(transparent)]
   PermissionDenied(#[from] PermissionDeniedError),
+  #[class(uri)]
   #[error("Invalid file path.\n  Specifier: {0}")]
   InvalidFilePath(Url),
+  #[class(inherit)]
   #[error(transparent)]
   NetDescriptorForUrlParse(#[from] NetDescriptorFromUrlParseError),
+  #[class(inherit)]
   #[error(transparent)]
   SysDescriptorParse(#[from] SysDescriptorParseError),
+  #[class(inherit)]
   #[error(transparent)]
   PathResolve(#[from] PathResolveError),
+  #[class(uri)]
   #[error(transparent)]
   HostParse(#[from] HostParseError),
+  #[class("NotCapable")]
+  #[error("Permission denied {0}")]
+  NotCapable(&'static str),
 }
 
 /// Wrapper struct for `Permissions` that can be shared across threads.
@@ -2567,6 +2592,7 @@ impl PermissionsContainer {
       }
       .into_read();
       inner.check(&desc, api_name)?;
+
       Ok(Cow::Owned(desc.0.resolved))
     }
   }
@@ -2575,7 +2601,7 @@ impl PermissionsContainer {
   /// by replacing it with the given `display`.
   #[inline(always)]
   pub fn check_read_blind(
-    &mut self,
+    &self,
     path: &Path,
     display: &str,
     api_name: &str,
@@ -2692,7 +2718,7 @@ impl PermissionsContainer {
 
   #[inline(always)]
   pub fn check_write_partial(
-    &mut self,
+    &self,
     path: &str,
     api_name: &str,
   ) -> Result<PathBuf, PermissionCheckError> {
@@ -2709,7 +2735,7 @@ impl PermissionsContainer {
 
   #[inline(always)]
   pub fn check_run(
-    &mut self,
+    &self,
     cmd: &RunQueryDescriptor,
     api_name: &str,
   ) -> Result<(), PermissionCheckError> {
@@ -2745,25 +2771,25 @@ impl PermissionsContainer {
   }
 
   #[inline(always)]
-  pub fn check_env(&mut self, var: &str) -> Result<(), PermissionCheckError> {
+  pub fn check_env(&self, var: &str) -> Result<(), PermissionCheckError> {
     self.inner.lock().env.check(var, None)?;
     Ok(())
   }
 
   #[inline(always)]
-  pub fn check_env_all(&mut self) -> Result<(), PermissionCheckError> {
+  pub fn check_env_all(&self) -> Result<(), PermissionCheckError> {
     self.inner.lock().env.check_all()?;
     Ok(())
   }
 
   #[inline(always)]
-  pub fn check_sys_all(&mut self) -> Result<(), PermissionCheckError> {
+  pub fn check_sys_all(&self) -> Result<(), PermissionCheckError> {
     self.inner.lock().sys.check_all()?;
     Ok(())
   }
 
   #[inline(always)]
-  pub fn check_ffi_all(&mut self) -> Result<(), PermissionCheckError> {
+  pub fn check_ffi_all(&self) -> Result<(), PermissionCheckError> {
     self.inner.lock().ffi.check_all()?;
     Ok(())
   }
@@ -2772,7 +2798,7 @@ impl PermissionsContainer {
   /// permissions are enabled!
   #[inline(always)]
   pub fn check_was_allow_all_flag_passed(
-    &mut self,
+    &self,
   ) -> Result<(), PermissionCheckError> {
     self.inner.lock().all.check()?;
     Ok(())
@@ -2781,7 +2807,7 @@ impl PermissionsContainer {
   /// Checks special file access, returning the failed permission type if
   /// not successful.
   pub fn check_special_file(
-    &mut self,
+    &self,
     path: &Path,
     _api_name: &str,
   ) -> Result<(), &'static str> {

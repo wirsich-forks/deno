@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
+use deno_core::anyhow::anyhow;
 use deno_core::anyhow::bail;
 use deno_core::anyhow::Context;
-use deno_core::error::generic_error;
 use deno_core::error::AnyError;
 use deno_core::futures::FutureExt;
 use deno_core::located_script_name;
@@ -22,6 +22,7 @@ use jupyter_runtime::messaging::StreamContent;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::args::Flags;
 use crate::args::JupyterFlags;
@@ -67,7 +68,8 @@ pub async fn kernel(
   // TODO(bartlomieju): should we run with all permissions?
   let permissions =
     PermissionsContainer::allow_all(factory.permission_desc_parser()?.clone());
-  let npm_resolver = factory.npm_resolver().await?.clone();
+  let npm_installer = factory.npm_installer_if_managed()?.cloned();
+  let tsconfig_resolver = factory.tsconfig_resolver()?;
   let resolver = factory.resolver().await?.clone();
   let worker_factory = factory.create_cli_main_worker_factory().await?;
   let (stdio_tx, stdio_rx) = mpsc::unbounded_channel();
@@ -115,8 +117,9 @@ pub async fn kernel(
   let worker = worker.into_main_worker();
   let mut repl_session = repl::ReplSession::initialize(
     cli_options,
-    npm_resolver,
+    npm_installer,
     resolver,
+    tsconfig_resolver,
     worker,
     main_module,
     test_event_receiver,
@@ -137,10 +140,10 @@ pub async fn kernel(
   }
   let cwd_url =
     Url::from_directory_path(cli_options.initial_cwd()).map_err(|_| {
-      generic_error(format!(
+      anyhow!(
         "Unable to construct URL from the path of cwd: {}",
         cli_options.initial_cwd().to_string_lossy(),
-      ))
+      )
     })?;
   repl_session.set_test_reporter_factory(Box::new(move || {
     Box::new(
@@ -388,7 +391,9 @@ impl JupyterReplSession {
         line_text,
         position,
       } => JupyterReplResponse::LspCompletions(
-        self.lsp_completions(&line_text, position).await,
+        self
+          .lsp_completions(&line_text, position, CancellationToken::new())
+          .await,
       ),
       JupyterReplRequest::JsGetProperties { object_id } => {
         JupyterReplResponse::JsGetProperties(
@@ -430,11 +435,12 @@ impl JupyterReplSession {
     &mut self,
     line_text: &str,
     position: usize,
+    token: CancellationToken,
   ) -> Vec<ReplCompletionItem> {
     self
       .repl_session
       .language_server
-      .completions(line_text, position)
+      .completions(line_text, position, token)
       .await
   }
 

@@ -18,13 +18,15 @@ use deno_ast::swc::visit::VisitWith;
 use deno_ast::MediaType;
 use deno_ast::ParsedSource;
 use deno_ast::SourceTextInfo;
-use deno_core::error::custom_error;
 use deno_core::error::AnyError;
 use deno_core::futures::future;
 use deno_core::futures::future::Shared;
 use deno_core::futures::FutureExt;
 use deno_core::parking_lot::Mutex;
+use deno_core::parking_lot::RwLock;
+use deno_core::resolve_url;
 use deno_core::ModuleSpecifier;
+use deno_error::JsErrorBox;
 use deno_graph::Resolution;
 use deno_path_util::url_to_file_path;
 use deno_runtime::deno_node;
@@ -33,8 +35,10 @@ use deno_semver::npm::NpmPackageReqReference;
 use deno_semver::package::PackageReq;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
+use node_resolver::cache::NodeResolutionThreadLocalCache;
 use node_resolver::NodeResolutionKind;
 use node_resolver::ResolutionMode;
+use once_cell::sync::Lazy;
 use tower_lsp::lsp_types as lsp;
 
 use super::cache::calculate_fs_version;
@@ -47,8 +51,8 @@ use super::testing::TestCollector;
 use super::testing::TestModule;
 use super::text::LineIndex;
 use super::tsc;
-use super::tsc::AssetDocument;
 use crate::graph_util::CliJsrUrlProvider;
+use crate::tsc::MaybeStaticSource;
 
 pub const DOCUMENT_SCHEMES: [&str; 5] =
   ["data", "blob", "file", "http", "https"];
@@ -179,10 +183,85 @@ impl IndexValid {
   }
 }
 
+/// An lsp representation of an asset in memory, that has either been retrieved
+/// from static assets built into Rust, or static assets built into tsc.
+#[derive(Debug)]
+pub struct AssetDocument {
+  specifier: ModuleSpecifier,
+  text: MaybeStaticSource,
+  line_index: Arc<LineIndex>,
+  maybe_navigation_tree: Mutex<Option<Arc<tsc::NavigationTree>>>,
+}
+
+impl AssetDocument {
+  pub fn new(specifier: ModuleSpecifier, text: MaybeStaticSource) -> Self {
+    let line_index = Arc::new(LineIndex::new(text.as_ref()));
+    Self {
+      specifier,
+      text,
+      line_index,
+      maybe_navigation_tree: Default::default(),
+    }
+  }
+
+  pub fn specifier(&self) -> &ModuleSpecifier {
+    &self.specifier
+  }
+
+  pub fn cache_navigation_tree(
+    &self,
+    navigation_tree: Arc<tsc::NavigationTree>,
+  ) {
+    *self.maybe_navigation_tree.lock() = Some(navigation_tree);
+  }
+
+  pub fn text(&self) -> MaybeStaticSource {
+    self.text.clone()
+  }
+
+  pub fn line_index(&self) -> Arc<LineIndex> {
+    self.line_index.clone()
+  }
+
+  pub fn maybe_navigation_tree(&self) -> Option<Arc<tsc::NavigationTree>> {
+    self.maybe_navigation_tree.lock().clone()
+  }
+}
+
+#[derive(Debug)]
+pub struct AssetDocuments {
+  inner: RwLock<HashMap<ModuleSpecifier, Arc<AssetDocument>>>,
+}
+
+impl AssetDocuments {
+  pub fn contains_key(&self, k: &ModuleSpecifier) -> bool {
+    self.inner.read().contains_key(k)
+  }
+
+  pub fn get(&self, k: &ModuleSpecifier) -> Option<Arc<AssetDocument>> {
+    self.inner.read().get(k).cloned()
+  }
+}
+
+pub static ASSET_DOCUMENTS: Lazy<AssetDocuments> =
+  Lazy::new(|| AssetDocuments {
+    inner: RwLock::new(
+      crate::tsc::LAZILY_LOADED_STATIC_ASSETS
+        .iter()
+        .map(|(k, v)| {
+          let url_str = format!("asset:///{k}");
+          let specifier = resolve_url(&url_str).unwrap();
+          let asset = Arc::new(AssetDocument::new(specifier.clone(), v.get()));
+          (specifier, asset)
+        })
+        .collect(),
+    ),
+  });
+
 #[derive(Debug, Clone)]
 pub enum AssetOrDocument {
   Document(Arc<Document>),
-  Asset(AssetDocument),
+  Asset(Arc<AssetDocument>),
 }
 
 impl AssetOrDocument {
@@ -217,10 +296,12 @@ impl AssetOrDocument {
     }
   }
 
-  pub fn text(&self) -> Arc<str> {
+  pub fn text(&self) -> MaybeStaticSource {
     match self {
       AssetOrDocument::Asset(a) => a.text(),
-      AssetOrDocument::Document(d) => d.text.clone(),
+      AssetOrDocument::Document(d) => {
+        MaybeStaticSource::Computed(d.text.clone())
+      }
     }
   }
 
@@ -268,6 +349,16 @@ impl AssetOrDocument {
     match self {
       AssetOrDocument::Asset(_) => ResolutionMode::Import,
       AssetOrDocument::Document(d) => d.resolution_mode(),
+    }
+  }
+
+  pub fn cache_navigation_tree(
+    &self,
+    navigation_tree: Arc<tsc::NavigationTree>,
+  ) {
+    match self {
+      AssetOrDocument::Asset(a) => a.cache_navigation_tree(navigation_tree),
+      AssetOrDocument::Document(d) => d.cache_navigation_tree(navigation_tree),
     }
   }
 }
@@ -480,7 +571,7 @@ impl Document {
       let is_cjs_resolver =
         resolver.as_is_cjs_resolver(self.file_referrer.as_ref());
       let npm_resolver =
-        resolver.create_graph_npm_resolver(self.file_referrer.as_ref());
+        resolver.as_graph_npm_resolver(self.file_referrer.as_ref());
       let config_data = resolver.as_config_data(self.file_referrer.as_ref());
       let jsx_import_source_config =
         config_data.and_then(|d| d.maybe_jsx_import_source_config());
@@ -503,7 +594,7 @@ impl Document {
                 s,
                 &CliJsrUrlProvider,
                 Some(&resolver),
-                Some(&npm_resolver),
+                Some(npm_resolver.as_ref()),
               ),
             )
           })
@@ -513,7 +604,7 @@ impl Document {
         Arc::new(d.with_new_resolver(
           &CliJsrUrlProvider,
           Some(&resolver),
-          Some(&npm_resolver),
+          Some(npm_resolver.as_ref()),
         ))
       });
       is_script = self.is_script;
@@ -897,6 +988,7 @@ impl FileSystemDocuments {
       }
     };
     if dirty {
+      NodeResolutionThreadLocalCache::clear();
       // attempt to update the file on the file system
       self.refresh_document(specifier, resolver, config, cache, file_referrer)
     } else {
@@ -936,7 +1028,7 @@ impl FileSystemDocuments {
         file_referrer.cloned(),
       )
     } else if specifier.scheme() == "data" {
-      let source = deno_graph::source::RawDataUrl::parse(specifier)
+      let source = deno_media_type::data_url::RawDataUrl::parse(specifier)
         .ok()?
         .decode()
         .ok()?;
@@ -1081,7 +1173,7 @@ impl Documents {
       .or_else(|| self.file_system_docs.remove_document(specifier))
       .map(Ok)
       .unwrap_or_else(|| {
-        Err(custom_error(
+        Err(JsErrorBox::new(
           "NotFound",
           format!("The specifier \"{specifier}\" was not found."),
         ))
@@ -1295,6 +1387,7 @@ impl Documents {
   /// For a given set of string specifiers, resolve each one from the graph,
   /// for a given referrer. This is used to provide resolution information to
   /// tsc when type checking.
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub fn resolve(
     &self,
     // (is_cjs: bool, raw_specifier: String)
@@ -1375,6 +1468,7 @@ impl Documents {
     self.resolver = resolver.clone();
 
     node_resolver::PackageJsonThreadLocalCache::clear();
+    NodeResolutionThreadLocalCache::clear();
 
     {
       let fs_docs = &self.file_system_docs;
@@ -1440,6 +1534,7 @@ impl Documents {
     if !is_fs_docs_dirty && !self.dirty {
       return;
     }
+    NodeResolutionThreadLocalCache::clear();
     let mut visit_doc = |doc: &Arc<Document>| {
       let scope = doc.scope();
       let dep_info = dep_info_by_scope.entry(scope.cloned()).or_default();
@@ -1551,6 +1646,7 @@ impl Documents {
     self.dirty = false;
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub fn resolve_dependency(
     &self,
     specifier: &ModuleSpecifier,
@@ -1702,7 +1798,7 @@ fn analyze_module(
 ) -> (ModuleResult, ResolutionMode) {
   match parsed_source_result {
     Ok(parsed_source) => {
-      let npm_resolver = resolver.create_graph_npm_resolver(file_referrer);
+      let npm_resolver = resolver.as_graph_npm_resolver(file_referrer);
       let cli_resolver = resolver.as_cli_resolver(file_referrer);
       let is_cjs_resolver = resolver.as_is_cjs_resolver(file_referrer);
       let config_data = resolver.as_config_data(file_referrer);
@@ -1731,7 +1827,7 @@ fn analyze_module(
             file_system: &deno_graph::source::NullFileSystem,
             jsr_url_provider: &CliJsrUrlProvider,
             maybe_resolver: Some(&resolver),
-            maybe_npm_resolver: Some(&npm_resolver),
+            maybe_npm_resolver: Some(npm_resolver.as_ref()),
           },
         )),
         module_resolution_mode,
@@ -1756,10 +1852,11 @@ fn bytes_to_content(
     // we use the dts representation for Wasm modules
     Ok(deno_graph::source::wasm::wasm_module_to_dts(&bytes)?)
   } else {
-    Ok(deno_graph::source::decode_owned_source(
-      specifier,
-      bytes,
-      maybe_charset,
+    let charset = maybe_charset.unwrap_or_else(|| {
+      deno_media_type::encoding::detect_charset(specifier, &bytes)
+    });
+    Ok(deno_media_type::encoding::decode_owned_source(
+      charset, bytes,
     )?)
   }
 }
@@ -1767,7 +1864,6 @@ fn bytes_to_content(
 #[cfg(test)]
 mod tests {
   use deno_config::deno_json::ConfigFile;
-  use deno_config::deno_json::ConfigParseOptions;
   use deno_core::serde_json;
   use deno_core::serde_json::json;
   use pretty_assertions::assert_eq;
@@ -1924,7 +2020,6 @@ console.log(b, "hello deno");
             })
             .to_string(),
             config.root_uri().unwrap().join("deno.json").unwrap(),
-            &ConfigParseOptions::default(),
           )
           .unwrap(),
         )
@@ -1968,7 +2063,6 @@ console.log(b, "hello deno");
             })
             .to_string(),
             config.root_uri().unwrap().join("deno.json").unwrap(),
-            &ConfigParseOptions::default(),
           )
           .unwrap(),
         )
