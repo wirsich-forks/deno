@@ -2326,7 +2326,7 @@ export function setupChannel(
         options,
         callback,
       });
-      return handleQueue.length < 16;
+      return handleQueue.length === 1;
     }
 
     if (handle !== undefined) {
