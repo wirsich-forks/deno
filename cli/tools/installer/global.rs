@@ -2176,6 +2176,7 @@ mod tests {
       },
       scopes,
       registry_configs: Default::default(),
+      min_release_age_days: None,
     })
   }
 
