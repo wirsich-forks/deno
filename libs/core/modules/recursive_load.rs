@@ -158,10 +158,6 @@ impl RecursiveModuleLoad {
   fn new(init: LoadInit, module_map_rc: Rc<ModuleMap>) -> Self {
     let id = module_map_rc.next_load_id();
     let loader = module_map_rc.loader.borrow().clone();
-    let requested_module_type = match &init {
-      LoadInit::DynamicImport(_, _, module_type, _) => module_type.clone(),
-      _ => RequestedModuleType::None,
-    };
     // Resolve the root specifier eagerly. For sync resolution, cache the
     // result. For async, store the future for later resolution.
     let resolve_response = Self::resolve_root_from_init(&init, &module_map_rc);
@@ -175,7 +171,8 @@ impl RecursiveModuleLoad {
       .as_ref()
       .and_then(|r| r.as_ref().ok())
       .and_then(|spec| {
-        module_map_rc.get_id(spec.as_str(), requested_module_type)
+        module_map_rc
+          .get_id(spec.as_str(), Self::requested_module_type_from_init(&init))
       });
     Self {
       id,
@@ -203,6 +200,23 @@ impl RecursiveModuleLoad {
 
   pub(crate) fn root_module_reference(&self) -> Option<&ModuleReference> {
     self.root_module_reference.as_ref()
+  }
+
+  fn requested_module_type_from_init(init: &LoadInit) -> &RequestedModuleType {
+    match init {
+      LoadInit::DynamicImport(_, _, module_type, _) => module_type,
+      _ => &RequestedModuleType::None,
+    }
+  }
+
+  fn set_root_module_id_from_resolved_specifier(
+    &mut self,
+    module_specifier: &ModuleSpecifier,
+  ) {
+    self.root_module_id = self.module_map_rc.get_id(
+      module_specifier.as_str(),
+      Self::requested_module_type_from_init(&self.init),
+    );
   }
 
   fn resolve_root_from_init(
@@ -236,6 +250,7 @@ impl RecursiveModuleLoad {
         );
         let spec = fut.await.map_err(CoreError::from)?;
         self.resolved_specifier = Some(Ok(spec.clone()));
+        self.set_root_module_id_from_resolved_specifier(&spec);
         spec
       }
     };
@@ -505,6 +520,28 @@ impl RecursiveModuleLoad {
                     .resolve_async(raw, &referrer_str, kind)
                     .await
                     .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+                  // The async resolver may map the raw specifier to a URL
+                  // that's already registered in the module map (e.g. a
+                  // bare `"path"` from an npm package resolving to
+                  // `node:path`, which was lazy-loaded earlier). In that
+                  // case the load step would try `take_lazy_esm_source`,
+                  // miss because the source was already consumed, and fall
+                  // through to `loader.load(node:path)` which doesn't
+                  // recognize the scheme. Short-circuit here so
+                  // `register_and_recurse_inner` later picks up the
+                  // existing module id via `get_id`.
+                  if module_map_rc
+                    .get_id(
+                      resolved.as_str(),
+                      &request.reference.requested_module_type,
+                    )
+                    .is_some()
+                  {
+                    visited_as_alias
+                      .borrow_mut()
+                      .insert(resolved.as_str().to_string());
+                    return Ok(None);
+                  }
                   let mut resolved_request = request;
                   resolved_request.reference.specifier = resolved.clone();
                   resolved_request.needs_resolve = false;
@@ -693,6 +730,7 @@ impl Stream for RecursiveModuleLoad {
         match resolve_fut.poll_unpin(cx) {
           Poll::Ready(Ok(module_specifier)) => {
             inner.pending_root_resolve = None;
+            inner.set_root_module_id_from_resolved_specifier(&module_specifier);
             Self::init_with_resolved_root(inner, module_specifier, cx)
           }
           Poll::Ready(Err(error)) => {
