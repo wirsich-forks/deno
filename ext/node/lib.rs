@@ -391,6 +391,7 @@ deno_core::extension!(deno_node,
   ],
   objects = [
     ops::perf_hooks::EldHistogram,
+    ops::perf_hooks::BaseHistogram,
     ops::handle_wrap::AsyncWrap,
     ops::handle_wrap::HandleWrap,
     ops::wasi::WasiContext,
