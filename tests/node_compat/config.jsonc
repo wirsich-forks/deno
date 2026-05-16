@@ -180,6 +180,7 @@
     "parallel/test-async-hooks-destroy-on-gc.js": {},
     "parallel/test-async-hooks-disable-gc-tracking.js": {},
     "parallel/test-async-hooks-enable-disable.js": {},
+    "parallel/test-async-hooks-enabledhooksexits.js": {},
     "parallel/test-async-hooks-prevent-double-destroy.js": {},
     "parallel/test-async-hooks-run-in-async-scope-caught-exception.js": {},
     "parallel/test-async-hooks-run-in-async-scope-this-arg.js": {},
