@@ -4252,6 +4252,9 @@
       "reason": "Node.js system CA certificate handling is not implemented in Deno"
     },
     "test-runner/test-output-arbitrary-output-colored.mjs": {},
+    "test-runner/test-output-assertion-color-tty.mjs": {},
+    "test-runner/test-output-coverage-width-80-color.mjs": {},
+    "test-runner/test-output-coverage-width-80-uncovered-lines-color.mjs": {},
     "test-runner/test-output-junit-reporter.mjs": {
       "exitCode": 1,
       "reason": "Runs without the previous missing test.expectFailure TypeError, but reporter snapshot output still differs from Node"
