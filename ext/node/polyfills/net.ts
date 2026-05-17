@@ -1047,7 +1047,6 @@ function _lookupAndConnect(self: Socket, options: TcpSocketConnectOptions) {
     family: options.family,
     hints: options.hints || 0,
     all: false,
-    port,
   };
 
   if (
@@ -1063,6 +1062,16 @@ function _lookupAndConnect(self: Socket, options: TcpSocketConnectOptions) {
   debug("connect: dns options", dnsOpts);
   self._host = host;
   const lookup = options.lookup || dnsLookup;
+  const getLookupDnsOpts = () => {
+    if (options.lookup === undefined) {
+      return { ...dnsOpts, port };
+    }
+    return {
+      family: dnsOpts.family,
+      hints: dnsOpts.hints,
+      all: dnsOpts.all,
+    };
+  };
 
   if (
     dnsOpts.family !== 4 &&
@@ -1073,11 +1082,6 @@ function _lookupAndConnect(self: Socket, options: TcpSocketConnectOptions) {
     debug("connect: autodetecting");
 
     dnsOpts.all = true;
-    const lookupOpts = options.lookup === undefined ? dnsOpts : {
-      family: dnsOpts.family,
-      hints: dnsOpts.hints,
-      all: dnsOpts.all,
-    };
     defaultTriggerAsyncIdScope(self[asyncIdSymbol], function () {
       _lookupAndConnectMultiple(
         self,
@@ -1085,7 +1089,7 @@ function _lookupAndConnect(self: Socket, options: TcpSocketConnectOptions) {
         lookup,
         host,
         options,
-        lookupOpts,
+        getLookupDnsOpts(),
         port,
         localAddress,
         localPort,
@@ -1097,14 +1101,9 @@ function _lookupAndConnect(self: Socket, options: TcpSocketConnectOptions) {
   }
 
   defaultTriggerAsyncIdScope(self[asyncIdSymbol], function () {
-    const lookupOpts = options.lookup === undefined ? dnsOpts : {
-      family: dnsOpts.family,
-      hints: dnsOpts.hints,
-      all: dnsOpts.all,
-    };
     lookup(
       host,
-      lookupOpts,
+      getLookupDnsOpts(),
       function emitLookup(
         err: ErrnoException | null,
         ip: string,
